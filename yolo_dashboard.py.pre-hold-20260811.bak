@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""YOLO dog-detection dashboard for the Peztz Raspberry Pi."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import html
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import signal
+import threading
+import time
+from urllib.parse import urlparse
+
+# Set these variables before OpenCV is imported.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
+import cv2
+from ultralytics import YOLO
+
+
+DEFAULT_MODEL = "/home/admin/peztz-ai/best_ncnn_model"
+DEFAULT_VERIFIER_MODEL = "/home/admin/peztz-ai/yolov8n_ncnn_model"
+DEFAULT_STREAM_URL = "http://34.50.7.78:8889/cage-a1/?controls=true&muted=true&autoplay=true"
+
+
+class LatestFrameReader:
+    """Continuously decode RTSP and retain only the newest frame."""
+
+    def __init__(self, source: str, reconnect_delay: float = 1.0) -> None:
+        self.source = source
+        self.reconnect_delay = reconnect_delay
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._frame = None
+        self._frame_id = 0
+        self._captured_at = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self, after_frame_id: int):
+        with self._lock:
+            if self._frame is None or self._frame_id <= after_frame_id:
+                return None
+            return self._frame_id, self._captured_at, self._frame.copy()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        capture = None
+        while not self._stop.is_set():
+            if capture is None or not capture.isOpened():
+                capture = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not capture.isOpened():
+                    capture.release()
+                    capture = None
+                    self._stop.wait(self.reconnect_delay)
+                    continue
+
+            success, frame = capture.read()
+            if not success or frame is None:
+                capture.release()
+                capture = None
+                self._stop.wait(self.reconnect_delay)
+                continue
+
+            with self._lock:
+                self._frame = frame
+                self._frame_id += 1
+                self._captured_at = time.time()
+
+        if capture is not None:
+            capture.release()
+
+
+class DetectionState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._payload = {
+            "event": "starting",
+            "message": "AI 모델을 준비하고 있습니다.",
+            "detections": [],
+            "updated_at": None,
+        }
+
+    def replace(self, payload: dict) -> None:
+        with self._lock:
+            self._payload = payload
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            payload = dict(self._payload)
+            for key in (
+                "detections",
+                "custom_candidates",
+                "rejected_candidates",
+                "verifier_persons",
+                "verifier_dogs",
+            ):
+                payload[key] = [dict(item) for item in self._payload.get(key, [])]
+            return payload
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", default=os.environ.get("CAMERA_RTSP_URL", ""))
+    parser.add_argument("--model", default=os.environ.get("YOLO_MODEL_PATH", DEFAULT_MODEL))
+    parser.add_argument(
+        "--verifier-model",
+        default=os.environ.get("YOLO_VERIFIER_MODEL_PATH", DEFAULT_VERIFIER_MODEL),
+    )
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--conf", type=float, default=0.50)
+    parser.add_argument("--verifier-conf", type=float, default=0.10)
+    parser.add_argument("--match-iou", type=float, default=0.20)
+    parser.add_argument("--bind", default="100.78.197.87")
+    parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--stream-url", default=DEFAULT_STREAM_URL)
+    return parser.parse_args()
+
+
+def normalized_detection(box, width: int, height: int, class_name: str) -> dict:
+    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+    return {
+        "class_name": class_name,
+        "confidence": round(float(box.conf[0]), 4),
+        "bbox_normalized": [
+            round(x1 / width, 6),
+            round(y1 / height, 6),
+            round(x2 / width, 6),
+            round(y2 / height, 6),
+        ],
+    }
+
+
+def intersection_over_union(first: list[float], second: list[float]) -> float:
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def run_detector(args: argparse.Namespace, state: DetectionState, stop: threading.Event) -> None:
+    try:
+        custom_model = YOLO(args.model, task="detect")
+        verifier_model = YOLO(args.verifier_model, task="detect")
+    except Exception as exc:
+        state.replace(
+            {
+                "event": "error",
+                "message": f"모델 로드 실패: {exc}",
+                "detections": [],
+                "updated_at": utc_now(),
+            }
+        )
+        return
+
+    reader = LatestFrameReader(args.source)
+    reader.start()
+    last_frame_id = 0
+
+    try:
+        while not stop.is_set():
+            packet = reader.latest(last_frame_id)
+            if packet is None:
+                time.sleep(0.02)
+                continue
+
+            frame_id, captured_at, frame = packet
+            last_frame_id = frame_id
+            height, width = frame.shape[:2]
+            started = time.perf_counter()
+
+            try:
+                custom_result = custom_model.predict(
+                    source=frame,
+                    imgsz=args.imgsz,
+                    conf=args.conf,
+                    verbose=False,
+                )[0]
+
+                custom_candidates = []
+                for box in custom_result.boxes:
+                    class_id = int(box.cls[0])
+                    class_name = str(custom_model.names[class_id])
+                    if "DOG" in class_name.upper():
+                        custom_candidates.append(
+                            normalized_detection(box, width, height, class_name)
+                        )
+
+                verifier_result = None
+                verifier_persons = []
+                verifier_dogs = []
+                if custom_candidates:
+                    verifier_result = verifier_model.predict(
+                        source=frame,
+                        imgsz=args.imgsz,
+                        conf=args.verifier_conf,
+                        classes=[0, 16],
+                        verbose=False,
+                    )[0]
+
+                    for box in verifier_result.boxes:
+                        class_id = int(box.cls[0])
+                        if class_id == 0:
+                            verifier_persons.append(
+                                normalized_detection(box, width, height, "person")
+                            )
+                        elif class_id == 16:
+                            verifier_dogs.append(
+                                normalized_detection(box, width, height, "dog")
+                            )
+            except Exception as exc:
+                state.replace(
+                    {
+                        "event": "error",
+                        "message": f"추론 실패: {exc}",
+                        "detections": [],
+                        "updated_at": utc_now(),
+                    }
+                )
+                time.sleep(1)
+                continue
+
+            detections = []
+            rejected_candidates = []
+            for candidate in custom_candidates:
+                matches = []
+                for verifier_dog in verifier_dogs:
+                    match_iou = intersection_over_union(
+                        candidate["bbox_normalized"],
+                        verifier_dog["bbox_normalized"],
+                    )
+                    if match_iou >= args.match_iou:
+                        matches.append((match_iou, verifier_dog))
+
+                if matches:
+                    match_iou, verifier_dog = max(matches, key=lambda item: item[0])
+                    accepted = dict(candidate)
+                    accepted["verifier_confidence"] = verifier_dog["confidence"]
+                    accepted["match_iou"] = round(match_iou, 4)
+                    detections.append(accepted)
+                else:
+                    rejected = dict(candidate)
+                    rejected["reason"] = "standard_model_did_not_confirm_dog"
+                    rejected_candidates.append(rejected)
+
+            wall_ms = round((time.perf_counter() - started) * 1000, 2)
+            event = "dog_detected" if detections else "no_dog"
+            custom_inference_ms = round(
+                float(custom_result.speed.get("inference", 0.0)), 2
+            )
+            verifier_inference_ms = (
+                round(float(verifier_result.speed.get("inference", 0.0)), 2)
+                if verifier_result is not None
+                else 0.0
+            )
+
+            if detections:
+                message = "두 모델이 강아지를 확인했습니다."
+            elif rejected_candidates and verifier_persons:
+                message = "사람으로 의심되는 DOG 후보를 차단했습니다."
+            elif rejected_candidates:
+                message = "표준 모델이 강아지를 확인하지 않아 DOG 후보를 차단했습니다."
+            else:
+                message = "강아지가 감지되지 않았습니다."
+
+            state.replace(
+                {
+                    "event": event,
+                    "message": message,
+                    "frame_id": frame_id,
+                    "frame_size": [width, height],
+                    "captured_at": datetime.fromtimestamp(captured_at, timezone.utc).isoformat(),
+                    "updated_at": utc_now(),
+                    "wall_ms": wall_ms,
+                    "inference_ms": round(custom_inference_ms + verifier_inference_ms, 2),
+                    "custom_inference_ms": custom_inference_ms,
+                    "verifier_inference_ms": verifier_inference_ms,
+                    "verifier_ran": verifier_result is not None,
+                    "detections": detections,
+                    "custom_candidates": custom_candidates,
+                    "rejected_candidates": rejected_candidates,
+                    "verifier_persons": verifier_persons,
+                    "verifier_dogs": verifier_dogs,
+                }
+            )
+    finally:
+        reader.close()
+
+
+def build_page(stream_url: str) -> bytes:
+    safe_stream_url = html.escape(stream_url, quote=True)
+    page = r'''<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peztz AI 반려견 모니터링</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #07111f; color: #eef6ff; }
+    main { width: min(1180px, 96vw); margin: 24px auto; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: clamp(20px, 3vw, 32px); }
+    .sub { color: #9db0c7; font-size: 14px; }
+    .viewer { position: relative; width: 100%; aspect-ratio: 2688 / 1520; overflow: hidden; border-radius: 16px; background: #000; box-shadow: 0 18px 50px #0009; }
+    iframe { width: 100%; height: 100%; border: 0; display: block; }
+    #overlay { position: absolute; inset: 0; pointer-events: none; }
+    .box { position: absolute; border: 4px solid #35f277; border-radius: 6px; box-shadow: 0 0 0 2px #001b0b99, 0 0 22px #35f27788; }
+    .label { position: absolute; left: -4px; top: -38px; padding: 7px 10px; background: #16a34a; color: white; font-size: 16px; font-weight: 800; border-radius: 6px 6px 0 0; white-space: nowrap; }
+    #badge { position: absolute; top: 18px; right: 18px; z-index: 5; padding: 11px 15px; border-radius: 999px; font-size: 16px; font-weight: 800; backdrop-filter: blur(8px); background: #334155dc; border: 1px solid #ffffff28; }
+    #badge.detected { background: #15803de8; }
+    #badge.error { background: #b91c1ce8; }
+    .panel { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 14px; }
+    .card { background: #101d2e; border: 1px solid #24364d; border-radius: 12px; padding: 14px; }
+    .card span { display: block; color: #91a5bd; font-size: 12px; margin-bottom: 5px; }
+    .card strong { font-size: 18px; }
+    @media (max-width: 700px) { .panel { grid-template-columns: 1fr; } #badge { top: 10px; right: 10px; font-size: 13px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Peztz AI 반려견 모니터링</h1>
+      <div class="sub">Tapo 실시간 영상 + 커스텀 YOLO·표준 YOLO 이중 검증</div>
+    </div>
+  </header>
+  <section class="viewer">
+    <iframe src="__STREAM_URL__" allow="autoplay; fullscreen; picture-in-picture" scrolling="no"></iframe>
+    <div id="overlay"></div>
+    <div id="badge">AI 준비 중</div>
+  </section>
+  <section class="panel">
+    <div class="card"><span>탐지 상태</span><strong id="status">준비 중</strong></div>
+    <div class="card"><span>최고 신뢰도</span><strong id="confidence">-</strong></div>
+    <div class="card"><span>표준 모델 검증</span><strong id="verification">-</strong></div>
+    <div class="card"><span>최근 추론 시간</span><strong id="latency">-</strong></div>
+  </section>
+</main>
+<script>
+  const badge = document.querySelector('#badge');
+  const overlay = document.querySelector('#overlay');
+  const statusText = document.querySelector('#status');
+  const confidenceText = document.querySelector('#confidence');
+  const verificationText = document.querySelector('#verification');
+  const latencyText = document.querySelector('#latency');
+
+  function setBadge(text, kind = '') {
+    badge.textContent = text;
+    badge.className = kind;
+  }
+
+  function drawBoxes(detections) {
+    overlay.querySelectorAll('.box').forEach((node) => node.remove());
+    detections.forEach((item) => {
+      const [x1, y1, x2, y2] = item.bbox_normalized;
+      const box = document.createElement('div');
+      box.className = 'box';
+      box.style.left = `${x1 * 100}%`;
+      box.style.top = `${y1 * 100}%`;
+      box.style.width = `${(x2 - x1) * 100}%`;
+      box.style.height = `${(y2 - y1) * 100}%`;
+      const label = document.createElement('div');
+      label.className = 'label';
+      const verifierConfidence = item.verifier_confidence == null
+        ? ''
+        : ` · 검증 ${(item.verifier_confidence * 100).toFixed(1)}%`;
+      label.textContent = `DOG ${(item.confidence * 100).toFixed(1)}%${verifierConfidence}`;
+      box.appendChild(label);
+      overlay.appendChild(box);
+    });
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch('/api/status', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      const detections = data.detections || [];
+      const verifierPersons = data.verifier_persons || [];
+      const verifierDogs = data.verifier_dogs || [];
+      const rejectedCandidates = data.rejected_candidates || [];
+      drawBoxes(detections);
+
+      if (data.event === 'dog_detected' && detections.length) {
+        const top = Math.max(...detections.map((item) => item.confidence));
+        setBadge(`강아지 이중 검증됨 ${(top * 100).toFixed(1)}%`, 'detected');
+        statusText.textContent = '강아지 확인';
+        confidenceText.textContent = `${(top * 100).toFixed(1)}%`;
+      } else if (data.event === 'no_dog') {
+        setBadge('강아지 감지 안 됨');
+        statusText.textContent = rejectedCandidates.length ? 'DOG 오탐 차단' : '감지 안 됨';
+        confidenceText.textContent = '-';
+      } else if (data.event === 'error') {
+        setBadge('AI 오류', 'error');
+        statusText.textContent = data.message || '오류';
+        confidenceText.textContent = '-';
+      } else {
+        setBadge('AI 준비 중');
+        statusText.textContent = data.message || '준비 중';
+        confidenceText.textContent = '-';
+      }
+      verificationText.textContent = data.verifier_ran
+        ? `사람 ${verifierPersons.length} · 강아지 ${verifierDogs.length} · 차단 ${rejectedCandidates.length}`
+        : '검증 후보 없음';
+      latencyText.textContent = data.wall_ms == null ? '-' : `${data.wall_ms.toFixed(0)} ms`;
+    } catch (error) {
+      drawBoxes([]);
+      setBadge('AI 서버 연결 끊김', 'error');
+      statusText.textContent = '연결 끊김';
+      confidenceText.textContent = '-';
+      verificationText.textContent = '-';
+      latencyText.textContent = '-';
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 700);
+</script>
+</body>
+</html>'''
+    return page.replace("__STREAM_URL__", safe_stream_url).encode("utf-8")
+
+
+def make_handler(state: DetectionState, page: bytes):
+    class DashboardHandler(BaseHTTPRequestHandler):
+        server_version = "PeztzDashboard/1.0"
+
+        def do_GET(self) -> None:
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                self._send(HTTPStatus.OK, "text/html; charset=utf-8", page)
+                return
+            if path == "/api/status":
+                payload = json.dumps(state.snapshot(), ensure_ascii=False).encode("utf-8")
+                self._send(HTTPStatus.OK, "application/json; charset=utf-8", payload)
+                return
+            if path == "/healthz":
+                self._send(HTTPStatus.OK, "text/plain; charset=utf-8", b"ok\n")
+                return
+            self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"not found\n")
+
+        def _send(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+    return DashboardHandler
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.source:
+        raise SystemExit("CAMERA_RTSP_URL is not set")
+    if not Path(args.model).exists():
+        raise SystemExit(f"model path does not exist: {args.model}")
+    if not Path(args.verifier_model).exists():
+        raise SystemExit(f"verifier model path does not exist: {args.verifier_model}")
+    for name, value in (
+        ("--conf", args.conf),
+        ("--verifier-conf", args.verifier_conf),
+        ("--match-iou", args.match_iou),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise SystemExit(f"{name} must be between 0 and 1")
+
+    state = DetectionState()
+    stop = threading.Event()
+    detector = threading.Thread(target=run_detector, args=(args, state, stop), daemon=True)
+    detector.start()
+
+    server = ThreadingHTTPServer((args.bind, args.port), make_handler(state, build_page(args.stream_url)))
+    server.daemon_threads = True
+
+    def request_stop(_signum, _frame) -> None:
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+    print(
+        json.dumps(
+            {
+                "event": "dashboard_started",
+                "url": f"http://{args.bind}:{args.port}/",
+                "model": args.model,
+                "verifier_model": args.verifier_model,
+                "imgsz": args.imgsz,
+                "conf": args.conf,
+                "verifier_conf": args.verifier_conf,
+                "match_iou": args.match_iou,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        stop.set()
+        detector.join(timeout=5)
+        server.server_close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
