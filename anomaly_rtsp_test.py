@@ -12,6 +12,11 @@ os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 import cv2
 import time
 import threading
+import queue
+import requests
+import uuid
+
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ultralytics import YOLO
 
@@ -32,6 +37,23 @@ YOLO_CONF = 0.80
 
 if not RTSP_URL:
     raise SystemExit("CAMERA_RTSP_URL is not set")
+
+EVENT_URL = os.getenv(
+    "PEZTZ_EVENT_URL",
+    "",
+).strip()
+
+DEVICE_API_KEY = os.getenv(
+    "PEZTZ_DEVICE_API_KEY",
+    "",
+).strip()
+
+CAMERA_ID = os.getenv(
+    "PEZTZ_CAMERA_ID",
+    "",
+).strip()
+
+EVENT_QUEUE = queue.Queue(maxsize=1000)
 
 
 # =========================================================
@@ -172,6 +194,186 @@ def get_latest_frame():
             latest_frame.copy()
         )
 
+# =========================================================
+# 이벤트 큐 적재
+# =========================================================
+def enqueue_event(
+    event_type: str,
+    frame_id: int,
+    captured_at: float,
+    confidence: float,
+    metadata: dict,
+) -> None:
+
+    payload = {
+        "externalEventId": str(uuid.uuid4()),
+
+        "cameraId": CAMERA_ID,
+
+        "eventType": event_type,
+
+        "confidence": confidence,
+
+        "occurredAt": datetime.fromtimestamp(
+            captured_at,
+            timezone.utc,
+        ).isoformat(),
+
+        "metadata": {
+            **metadata,
+
+            "frameId": frame_id,
+
+            "detectedAnimalType": "DOG",
+
+            "detectionMethod":
+                "YOLO_BBOX_HEURISTIC",
+        },
+    }
+
+    try:
+
+        EVENT_QUEUE.put_nowait(
+            payload
+        )
+
+        print(
+            f"[EVENT QUEUED] "
+            f"type={event_type} "
+            f"id={payload['externalEventId']}",
+            flush=True,
+        )
+
+    except queue.Full:
+
+        print(
+            f"[EVENT QUEUE FULL] "
+            f"type={event_type} "
+            f"id={payload['externalEventId']}",
+            flush=True,
+        )
+# =========================================================
+# 설정 검사 함수
+# =========================================================
+
+def validate_event_config() -> None:
+    missing = []
+
+    if not EVENT_URL:
+        missing.append("PEZTZ_EVENT_URL")
+
+    if not DEVICE_API_KEY:
+        missing.append("PEZTZ_DEVICE_API_KEY")
+
+    if not CAMERA_ID:
+        missing.append("PEZTZ_CAMERA_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Missing event configuration: "
+            + ", ".join(missing)
+        )
+
+
+# =========================================================
+# 이벤트 전송 스레드
+# =========================================================
+def event_sender_worker(
+    sender_stop_event: threading.Event,
+) -> None:
+
+    while not sender_stop_event.is_set():
+
+        try:
+            payload = EVENT_QUEUE.get(
+                timeout=0.5
+            )
+
+        except queue.Empty:
+            continue
+
+        try:
+            while not sender_stop_event.is_set():
+
+                try:
+                    response = requests.post(
+                        EVENT_URL,
+                        json=payload,
+                        headers={
+                            "X-Device-Api-Key":
+                                DEVICE_API_KEY,
+                        },
+                        timeout=5,
+                    )
+
+                except requests.RequestException as error:
+
+                    print(
+                        f"[EVENT SEND FAILED] "
+                        f"type={payload['eventType']} "
+                        f"id={payload['externalEventId']} "
+                        f"error={error}",
+                        flush=True,
+                    )
+
+                    sender_stop_event.wait(5)
+                    continue
+
+
+                # =========================================
+                # 성공
+                # =========================================
+                if 200 <= response.status_code < 300:
+
+                    print(
+                        f"[EVENT SENT] "
+                        f"type={payload['eventType']} "
+                        f"id={payload['externalEventId']} "
+                        f"status={response.status_code}",
+                        flush=True,
+                    )
+
+                    break
+
+
+                # =========================================
+                # 재시도 대상
+                # 5xx / timeout 계열 / rate limit
+                # =========================================
+                if (
+                    response.status_code >= 500
+                    or response.status_code in (408, 429)
+                ):
+
+                    print(
+                        f"[EVENT RETRY] "
+                        f"type={payload['eventType']} "
+                        f"id={payload['externalEventId']} "
+                        f"status={response.status_code}",
+                        flush=True,
+                    )
+
+                    sender_stop_event.wait(5)
+                    continue
+
+
+                # =========================================
+                # 재시도하지 않는 오류
+                # 400 / 401 / 404 / 409 / 422 등
+                # =========================================
+                print(
+                    f"[EVENT REJECTED] "
+                    f"type={payload['eventType']} "
+                    f"id={payload['externalEventId']} "
+                    f"status={response.status_code} "
+                    f"body={response.text[:500]}",
+                    flush=True,
+                )
+
+                break
+
+        finally:
+            EVENT_QUEUE.task_done()
 
 # =========================================================
 # YOLO + 이상행동 분석
@@ -334,9 +536,8 @@ def yolo_worker():
 
 
                 # =========================================
-                # DB 연동 예정 포인트
-                #
-                # 쿨다운이 적용된 이벤트만 True
+                # 이벤트 전송
+                # 10초 쿨다운 통과 시에만 실행
                 # =========================================
                 if anomaly["should_log_pacing"]:
 
@@ -346,15 +547,28 @@ def yolo_worker():
                         f"frame={frame_id}"
                     )
 
-
-                    # 나중에 여기에
-                    # pet_logs INSERT 호출
-                    #
-                    # save_pet_log(
-                    #     log_type="PACING",
-                    #     ...
-                    # )
-
+                    enqueue_event(
+                        event_type="PACING",
+                        frame_id=frame_id,
+                        captured_at=captured_at,
+                        confidence=confidence,
+                        metadata={
+                            "distance": round(
+                                anomaly["distance"],
+                                2,
+                            ),
+                            "avg_distance": round(
+                                anomaly["avg_distance"],
+                                2,
+                            ),
+                            "bbox": [
+                                round(x1, 2),
+                                round(y1, 2),
+                                round(x2, 2),
+                                round(y2, 2),
+                            ],
+                        },
+                    )
 
                 if anomaly["should_log_spinning"]:
 
@@ -364,11 +578,28 @@ def yolo_worker():
                         f"frame={frame_id}"
                     )
 
-
-                    # 나중에 여기에
-                    # pet_logs INSERT 호출
-
-
+                    enqueue_event(
+                        event_type="SPINNING",
+                        frame_id=frame_id,
+                        captured_at=captured_at,
+                        confidence=confidence,
+                        metadata={
+                            "ratio_diff": round(
+                                anomaly["ratio_diff"],
+                                4,
+                            ),
+                            "avg_ratio_diff": round(
+                                anomaly["avg_ratio_diff"],
+                                4,
+                            ),
+                            "bbox": [
+                                round(x1, 2),
+                                round(y1, 2),
+                                round(x2, 2),
+                                round(y2, 2),
+                            ],
+                        },
+                    )
                 # =========================================
                 # 화면 표시용 결과
                 # =========================================
@@ -884,6 +1115,8 @@ PACING / SPINNING
 # =========================================================
 def main():
 
+    validate_event_config()
+
     print(
         "=========================================="
     )
@@ -934,7 +1167,14 @@ def main():
         daemon=True
     )
 
+    event_sender_thread = threading.Thread(
+    target=event_sender_worker,
+    args=(stop_event,),
+    daemon=True,
+    name="event-sender",
+)
 
+    event_sender_thread.start()
     camera_thread.start()
     yolo_thread.start()
     display_thread.start()
@@ -968,6 +1208,10 @@ def main():
         stop_event.set()
 
         server.server_close()
+
+        event_sender_thread.join(
+        timeout=2
+        )
 
         camera_thread.join(
             timeout=2
