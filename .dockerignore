@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+venv
+__pycache__
+*.pyc
+*.jpg
+*.jpeg
+*.png
+*.bak
+*_ncnn_model
+yolov8n.pt
+prepare_verifier.py
+test_*.py
+yolo_dashboard.py
+yolo_live.py
+peztz-yolo-dashboard.service

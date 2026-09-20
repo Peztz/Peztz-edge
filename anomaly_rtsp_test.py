@@ -26,17 +26,42 @@ from anomaly_detector import AnomalyDetector
 # =========================================================
 # 기본 설정
 # =========================================================
-MODEL_PATH = "/home/admin/peztz-ai/best_ncnn_model"
-RTSP_URL = os.environ.get("CAMERA_RTSP_URL")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-WEB_BIND = "0.0.0.0"
-WEB_PORT = 8081
 
-YOLO_IMGSZ = 640
-YOLO_CONF = 0.80
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer") from exc
+
+
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+
+
+MODEL_PATH = os.getenv(
+    "VISION_MODEL_PATH",
+    os.path.join(APP_DIR, "best.pt"),
+).strip()
+RTSP_URL = os.getenv("CAMERA_RTSP_URL", "").strip()
+
+WEB_BIND = os.getenv("VISION_WEB_BIND", "0.0.0.0").strip()
+WEB_PORT = env_int("VISION_WEB_PORT", 8081)
+
+YOLO_IMGSZ = env_int("VISION_IMGSZ", 640)
+YOLO_CONF = env_float("VISION_CONF", 0.80)
+VISION_DEVICE = os.getenv("VISION_DEVICE", "cpu").strip()
+VISION_FPS = env_float("VISION_FPS", 5.0)
 
 if not RTSP_URL:
     raise SystemExit("CAMERA_RTSP_URL is not set")
+
+if VISION_FPS <= 0:
+    raise SystemExit("VISION_FPS must be greater than 0")
 
 EVENT_URL = os.getenv(
     "PEZTZ_EVENT_URL",
@@ -386,7 +411,7 @@ def yolo_worker():
     global latest_yolo_ms
 
 
-    print("🤖 YOLO NCNN 모델 로딩...")
+    print("🤖 YOLO 모델 로딩...")
 
     model = YOLO(
         MODEL_PATH,
@@ -397,9 +422,19 @@ def yolo_worker():
 
 
     last_processed_frame_id = -1
+    inference_interval = 1.0 / VISION_FPS
+    next_inference_at = time.monotonic()
 
 
     while not stop_event.is_set():
+
+        wait_seconds = next_inference_at - time.monotonic()
+
+        if wait_seconds > 0:
+            stop_event.wait(wait_seconds)
+
+            if stop_event.is_set():
+                break
 
         packet = get_latest_frame()
 
@@ -425,6 +460,7 @@ def yolo_worker():
         # YOLO 추론
         # =================================================
         started = time.perf_counter()
+        next_inference_at = time.monotonic() + inference_interval
 
         try:
 
@@ -432,6 +468,7 @@ def yolo_worker():
                 source=frame,
                 imgsz=YOLO_IMGSZ,
                 conf=YOLO_CONF,
+                device=VISION_DEVICE,
                 verbose=False
             )
 
@@ -936,6 +973,17 @@ class StreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
+        if self.path == "/healthz":
+
+            body = b"ok\n"
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if self.path == "/":
 
             page = """
@@ -982,10 +1030,10 @@ img {
 
 <main>
 
-<h1>PEZTZ Edge AI Vision</h1>
+<h1>PEZTZ Vision Worker</h1>
 
 <p>
-Tapo stream2 · YOLO NCNN ·
+MediaMTX RTSP · YOLO ·
 PACING / SPINNING
 </p>
 
@@ -1122,7 +1170,7 @@ def main():
     )
 
     print(
-        " PEZTZ Edge AI 이상행동 테스트"
+        " PEZTZ Vision Worker"
     )
 
     print(
@@ -1138,11 +1186,15 @@ def main():
     )
 
     print(
-        "SOURCE: Tapo stream2"
+        f"DEVICE: {VISION_DEVICE}"
     )
 
     print(
-        f"WEB   : http://100.98.148.71:{WEB_PORT}"
+        f"FPS   : {VISION_FPS}"
+    )
+
+    print(
+        f"WEB   : http://{WEB_BIND}:{WEB_PORT}"
     )
 
     print(
